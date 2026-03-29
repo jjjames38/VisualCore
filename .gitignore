@@ -1,0 +1,54 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Environment
+.env
+.env.local
+.env.production
+
+# Build
+dist/
+build/
+*.js
+*.js.map
+*.d.ts
+!src/**/*.d.ts
+
+# Models (large files — download separately)
+models/
+*.safetensors
+*.ckpt
+*.bin
+*.pt
+*.pth
+
+# LoRA training data & outputs
+lora_data/
+loras/
+
+# Generated assets
+data/
+output/
+/shared/
+
+# Docker volumes
+docker/hunyuan/ckpts/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test
+coverage/
+
+# Temp
+tmp/
+*.tmp

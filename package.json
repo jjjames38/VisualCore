@@ -1,0 +1,48 @@
+{
+  "name": "visualcore",
+  "version": "1.0.0",
+  "description": "Self-hosted AI image & video generation for RenderForge. Replaces Seedream/Seedance/Ideogram API costs with local GPU inference.",
+  "private": true,
+  "type": "module",
+  "main": "dist/create/providers/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest",
+    "test:watch": "vitest --watch",
+    "lint": "eslint src/ tests/",
+    "download-models": "bash scripts/download-models.sh --all",
+    "train-loras": "bash scripts/train-all-loras.sh",
+    "poc-test": "bash scripts/poc-test.sh"
+  },
+  "dependencies": {
+    "ws": "^8.18.0",
+    "bullmq": "^5.12.0",
+    "ioredis": "^5.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jjjames38/VisualCore.git"
+  },
+  "license": "MIT",
+  "keywords": [
+    "ai",
+    "image-generation",
+    "video-generation",
+    "flux",
+    "hunyuanvideo",
+    "comfyui",
+    "renderforge",
+    "self-hosted",
+    "gpu-inference"
+  ]
+}

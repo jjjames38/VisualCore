@@ -1,0 +1,193 @@
+# ═══════════════════════════════════════════════════════════════
+#  RenderForge + VisualCore + VoiceCore — GPU Production Stack
+# ═══════════════════════════════════════════════════════════════
+#
+#  All services share a single RTX 4090 (24GB VRAM).
+#  GPU Memory Manager handles model loading/swapping.
+#
+#  Usage:
+#    docker compose -f docker/docker-compose.gpu.yml up -d
+#
+#  Scale render workers:
+#    docker compose -f docker/docker-compose.gpu.yml up -d --scale renderforge=4
+#
+# ═══════════════════════════════════════════════════════════════
+
+version: '3.8'
+
+x-gpu-device: &gpu-device
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: 1
+            capabilities: [gpu]
+
+services:
+  # ──────────────────────────────────────────
+  #  RenderForge (main application)
+  # ──────────────────────────────────────────
+  renderforge:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "${PORT:-3000}:3000"
+    env_file: ../.env
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - CHROMIUM_WS=ws://chromium:3000
+      - COMFYUI_HOST=comfyui
+      - COMFYUI_PORT=8188
+      - HUNYUAN_HOST=hunyuan
+      - HUNYUAN_PORT=8190
+    volumes:
+      - renderforge-data:/data
+      - shared-assets:/shared    # Shared between RenderForge and GPU services
+    depends_on:
+      redis:
+        condition: service_healthy
+      chromium:
+        condition: service_started
+      comfyui:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ──────────────────────────────────────────
+  #  Chromium (Puppeteer rendering target)
+  # ──────────────────────────────────────────
+  chromium:
+    image: browserless/chrome:latest
+    environment:
+      - CONNECTION_TIMEOUT=60000
+      - MAX_CONCURRENT_SESSIONS=4
+      - PREBOOT_CHROME=true
+    tmpfs:
+      - /tmp:size=2G
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────
+  #  Redis (BullMQ job queue)
+  # ──────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────
+  #  ComfyUI (Flux image generation)
+  # ──────────────────────────────────────────
+  #  Runs Flux.2 Klein 4B for text-to-image.
+  #  API mode enabled for RenderForge integration.
+  # ──────────────────────────────────────────
+  comfyui:
+    image: comfyorg/comfyui:latest
+    ports:
+      - "8188:8188"
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+      - CLI_ARGS=--listen 0.0.0.0 --port 8188 --enable-cors-header
+    volumes:
+      - comfyui-models:/root/ComfyUI/models/checkpoints
+      - comfyui-loras:/root/ComfyUI/models/loras
+      - comfyui-output:/root/ComfyUI/output
+      - shared-assets:/shared
+    <<: *gpu-device
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8188/system_stats"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────
+  #  HunyuanVideo 1.5 (video generation)
+  # ──────────────────────────────────────────
+  #  Runs HunyuanVideo 1.5 step-distilled model.
+  #  REST API wrapper for RenderForge integration.
+  #  14GB VRAM with CPU offloading.
+  # ──────────────────────────────────────────
+  hunyuan:
+    build:
+      context: ./hunyuan
+      dockerfile: Dockerfile
+    ports:
+      - "8190:8190"
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+      - ENABLE_STEP_DISTILL=true
+      - ENABLE_CPU_OFFLOAD=true
+      - DEFAULT_STEPS=8
+      - HOST=0.0.0.0
+      - PORT=8190
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128
+    volumes:
+      - hunyuan-models:/app/ckpts
+      - shared-assets:/shared
+    <<: *gpu-device
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8190/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s  # Model loading takes time
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────
+  #  VoiceCore / Fish Speech S2 (TTS)
+  # ──────────────────────────────────────────
+  #  Always-resident model (~2GB VRAM).
+  #  Shares GPU with ComfyUI/HunyuanVideo.
+  # ──────────────────────────────────────────
+  voicecore:
+    image: fishaudio/fish-speech:latest-server-cuda
+    ports:
+      - "8080:8080"
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+    volumes:
+      - voicecore-models:/app/models
+      - voicecore-refs:/app/references    # 9 tier reference voices
+      - shared-assets:/shared
+    <<: *gpu-device
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  renderforge-data:
+    driver: local
+  redis-data:
+    driver: local
+  comfyui-models:
+    driver: local
+  comfyui-loras:
+    driver: local
+  comfyui-output:
+    driver: local
+  hunyuan-models:
+    driver: local
+  voicecore-models:
+    driver: local
+  voicecore-refs:
+    driver: local
+  shared-assets:
+    driver: local
