@@ -226,3 +226,9 @@ TypeScript, Fastify, BullMQ + Redis, ComfyUI (WebSocket), HunyuanVideo (FastAPI)
 ## License
 
 MIT
+
+## Roadmap & TODO
+
+- [ ] 🚀 초기 환경 설정 완료
+- [ ] 🛠️ 핵심 로직 고도화 진행 중
+- [x] 🛡️ Gstack Ecosystem 통합 완료
