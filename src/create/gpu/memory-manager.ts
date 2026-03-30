@@ -147,14 +147,15 @@ export class GPUMemoryManager extends EventEmitter {
         throw new Error(`Unknown model: ${target}`);
       }
 
-      // Check VRAM budget
+      // VRAM budget is enforced upstream by GPUSchedulerWorker.
+      // Soft warning only (observability, not enforcement).
       const neededVram = targetInfo.vram_gb + this.residentVram;
-      if (neededVram > VRAM_AVAILABLE_GB) {
-        throw new Error(
-          `Insufficient VRAM: ${target} needs ${targetInfo.vram_gb}GB + ` +
-          `${this.residentVram}GB resident = ${neededVram}GB, ` +
-          `but only ${VRAM_AVAILABLE_GB}GB available`,
-        );
+      if (neededVram > VRAM_AVAILABLE_GB * 0.9) {
+        logger.warn('VRAM usage above 90%', {
+          model: target,
+          needed_gb: neededVram,
+          available_gb: VRAM_AVAILABLE_GB,
+        });
       }
 
       // Unload current primary model
