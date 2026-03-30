@@ -8,7 +8,7 @@
  *   - fallback logic (local unavailable → remote API)
  */
 
-import { type GenerateRequest, type GenerateProvider, type ProviderName, type VisualCoreConfig } from './types.js';
+import { type GenerateRequest, type GenerateProvider, type ProviderName, type VisualCoreConfig } from '@gstack/types';
 import { FluxKleinProvider } from './flux-klein.js';
 import { HunyuanLocalProvider } from './hunyuan-local.js';
 import { SeedanceRemoteProvider } from './seedance-remote.js';

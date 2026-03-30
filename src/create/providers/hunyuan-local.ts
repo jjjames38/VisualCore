@@ -17,7 +17,7 @@ import {
   type GenerateRequest,
   type GenerateResponse,
   type ProviderName,
-} from './types.js';
+} from '@gstack/types';
 import { logger } from '../../config/logger.js';
 
 interface HunyuanConfig {

@@ -8,7 +8,7 @@
  */
 
 import { Queue, Worker, type Job } from 'bullmq';
-import { type GenerateRequest, type GenerateResponse, type VisualCoreConfig } from '../providers/types.js';
+import { type GenerateRequest, type GenerateResponse, type VisualCoreConfig } from '@gstack/types';
 import { ProviderRouter } from '../providers/router.js';
 import { QCPipeline } from '../qc/pipeline.js';
 import { GPUMemoryManager } from '../gpu/memory-manager.js';

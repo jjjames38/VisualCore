@@ -5,4 +5,4 @@ export { HunyuanLocalProvider } from './hunyuan-local.js';
 export { SeedanceRemoteProvider } from './seedance-remote.js';
 export { RealEsrganProvider } from './realesrgan.js';
 export { ProviderRouter } from './router.js';
-export * from './types.js';
+export * from '@gstack/types';

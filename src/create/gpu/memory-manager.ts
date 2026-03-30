@@ -19,7 +19,7 @@
  *   [flux-klein, hunyuan]        → 8 + 14 = 22GB ❌ too close to 24GB limit
  */
 
-import { type ModelSlot, type GPUStatus } from '../providers/types.js';
+import { type ModelSlot, type GPUStatus } from '@gstack/types';
 import { logger } from '../../config/logger.js';
 import { EventEmitter } from 'node:events';
 

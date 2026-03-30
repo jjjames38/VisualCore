@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { resolveDimensions, type GenerateRequest, type VisualCoreConfig } from '../src/create/providers/types.js';
+import { resolveDimensions, type GenerateRequest, type VisualCoreConfig } from '@gstack/types';
 import { GPUMemoryManager } from '../src/create/gpu/memory-manager.js';
 
 // ─── resolveDimensions ───

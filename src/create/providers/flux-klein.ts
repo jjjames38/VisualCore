@@ -20,7 +20,7 @@ import {
   type GenerateResponse,
   type ProviderName,
   resolveDimensions,
-} from './types.js';
+} from '@gstack/types';
 import { logger } from '../../config/logger.js';
 
 interface ComfyUIConfig {

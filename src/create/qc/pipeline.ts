@@ -21,7 +21,7 @@ import {
   type GenerateResponse,
   type GenerateProvider,
   type VisualCoreConfig,
-} from '../providers/types.js';
+} from '@gstack/types';
 import { logger } from '../../config/logger.js';
 
 const execAsync = promisify(exec);
