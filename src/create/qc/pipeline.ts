@@ -12,110 +12,51 @@
  * Fallback: After max retries, optionally fall back to external API.
  */
 
-import { exec } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { existsSync } from 'node:fs';
+import { resolve, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   type QCResult,
   type QCScores,
   type GenerateRequest,
   type GenerateResponse,
   type GenerateProvider,
-  type VisualCoreConfig,
 } from '@gstack/types';
 import { logger } from '../../config/logger.js';
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
+
+// Resolve path to the external QC Python script
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const QC_SCRIPT_PATH = resolve(__dirname, '../../../scripts/qc_evaluate.py');
+const QC_SERVICE_URL = process.env.QC_SERVICE_URL || '';
 
 // ─── QC Configuration ───
 
 interface QCConfig {
   clip_threshold: number;       // 0.25 default
-  aesthetic_threshold: number;  // 5.0 default
-  nsfw_threshold: number;       // 0.3 default
-  temporal_threshold: number;   // 0.8 default
-  max_retries: number;          // 3 default
-  fallback_to_api: boolean;     // true default
+  aesthetic_threshold: number;   // 5.0 default
+  nsfw_threshold: number;        // 0.3 default
+  temporal_threshold: number;    // 0.8 default
+  max_retries: number;           // 3 default
+  fallback_to_api: boolean;      // true default
 }
 
 // ─── Image QC ───
 
 export class ImageQC {
   private config: QCConfig;
-  private pythonScript: string;
 
   constructor(config: QCConfig) {
     this.config = config;
-    // Python script for CLIP + Aesthetic scoring (runs as subprocess)
-    this.pythonScript = `
-import sys, json, torch
-from PIL import Image
-
-def evaluate(image_path, prompt):
-    scores = {}
-    
-    # CLIP Score
-    try:
-        from transformers import CLIPProcessor, CLIPModel
-        model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-        processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-        image = Image.open(image_path)
-        inputs = processor(text=[prompt], images=image, return_tensors="pt", padding=True)
-        outputs = model(**inputs)
-        logits = outputs.logits_per_image
-        scores["clip_score"] = float(logits.softmax(dim=1)[0][0])
-    except Exception as e:
-        scores["clip_score"] = -1
-        scores["clip_error"] = str(e)
-    
-    # Aesthetic Score (LAION aesthetic predictor)
-    try:
-        from transformers import pipeline
-        aesthetic = pipeline("image-classification", model="cafeai/cafe_aesthetic")
-        result = aesthetic(image_path)
-        # Convert to 0-10 scale
-        for r in result:
-            if r["label"] == "aesthetic":
-                scores["aesthetic_score"] = round(r["score"] * 10, 2)
-                break
-        else:
-            scores["aesthetic_score"] = 5.0
-    except Exception as e:
-        scores["aesthetic_score"] = -1
-        scores["aesthetic_error"] = str(e)
-    
-    # NSFW Detection
-    try:
-        from transformers import pipeline
-        nsfw = pipeline("image-classification", model="Falconsai/nsfw_image_detection")
-        result = nsfw(image_path)
-        for r in result:
-            if r["label"] == "nsfw":
-                scores["nsfw_score"] = round(r["score"], 4)
-                break
-        else:
-            scores["nsfw_score"] = 0.0
-    except Exception as e:
-        scores["nsfw_score"] = -1
-        scores["nsfw_error"] = str(e)
-    
-    return scores
-
-if __name__ == "__main__":
-    image_path = sys.argv[1]
-    prompt = sys.argv[2]
-    result = evaluate(image_path, prompt)
-    print(json.dumps(result))
-`.trim();
   }
 
-  /**
-   * Evaluate image quality.
-   */
   async evaluate(imagePath: string, prompt: string): Promise<QCResult> {
     const scores = await this.computeScores(imagePath, prompt);
     const issues: string[] = [];
 
-    // Check thresholds
     if (scores.clip_score != null && scores.clip_score >= 0) {
       if (scores.clip_score < this.config.clip_threshold) {
         issues.push(`CLIP score ${scores.clip_score.toFixed(3)} < threshold ${this.config.clip_threshold}`);
@@ -138,50 +79,73 @@ if __name__ == "__main__":
       pass: issues.length === 0,
       scores,
       issues,
-      attempt: 0, // Will be set by the retry wrapper
+      attempt: 0,
     };
   }
 
   /**
-   * Compute all scores via Python subprocess.
-   * Falls back to basic checks if Python deps unavailable.
+   * Compute scores via external QC service (HTTP) or Python script (execFile).
+   * No shell is used — arguments are passed as an array to prevent injection.
    */
   private async computeScores(imagePath: string, prompt: string): Promise<QCScores> {
+    // Priority 1: HTTP QC service (if configured)
+    if (QC_SERVICE_URL) {
+      try {
+        return await this.computeViaService(imagePath, prompt);
+      } catch (error) {
+        logger.warn('QC service call failed, falling back to script', { error });
+      }
+    }
+
+    // Priority 2: External Python script via execFile (no shell)
     try {
-      const escapedPrompt = prompt.replace(/"/g, '\\"').replace(/'/g, "\\'");
-      const { stdout } = await execAsync(
-        `python3 -c '${this.pythonScript.replace(/'/g, "\\'")}' "${imagePath}" "${escapedPrompt}"`,
-        { timeout: 30_000 },
+      const { stdout } = await execFileAsync(
+        'python3',
+        [QC_SCRIPT_PATH, imagePath, prompt],
+        { timeout: 60_000 },
       );
       return JSON.parse(stdout.trim()) as QCScores;
     } catch (error) {
-      logger.warn('Python QC scoring failed, using basic checks', { error });
+      logger.warn('Python QC script failed, using basic checks', { error });
       return this.basicChecks(imagePath);
     }
   }
 
+  /** Call QC HTTP service (future FastAPI endpoint). */
+  private async computeViaService(imagePath: string, prompt: string): Promise<QCScores> {
+    const res = await fetch(`${QC_SERVICE_URL}/evaluate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image_path: imagePath, prompt }),
+      signal: AbortSignal.timeout(30_000),
+    });
+
+    if (!res.ok) {
+      throw new Error(`QC service error: ${res.status}`);
+    }
+
+    return (await res.json()) as QCScores;
+  }
+
   /**
    * Basic quality checks without ML models (fallback).
-   * Checks file size, dimensions, and basic pixel statistics.
+   * Uses ffprobe via execFile (no shell).
    */
   private async basicChecks(imagePath: string): Promise<QCScores> {
     try {
-      // Use ffprobe for basic image stats
-      const { stdout } = await execAsync(
-        `ffprobe -v quiet -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "${imagePath}"`,
+      const { stdout } = await execFileAsync(
+        'ffprobe',
+        ['-v', 'quiet', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=p=0', imagePath],
       );
       const [w, h] = stdout.trim().split(',').map(Number);
-
-      // Very basic: check if image is at least 256x256
       const dimensionOk = w >= 256 && h >= 256;
 
       return {
-        clip_score: dimensionOk ? 0.3 : 0.1, // Assume passable if dimensions OK
+        clip_score: dimensionOk ? 0.3 : 0.1,
         aesthetic_score: dimensionOk ? 6.0 : 3.0,
         nsfw_score: 0.0,
       };
     } catch {
-      // Can't even probe the file — fail
       return { clip_score: 0, aesthetic_score: 0, nsfw_score: 0 };
     }
   }
@@ -196,14 +160,10 @@ export class VideoQC {
     this.config = config;
   }
 
-  /**
-   * Evaluate video quality.
-   */
   async evaluate(videoPath: string, prompt: string): Promise<QCResult> {
     const scores = await this.computeScores(videoPath, prompt);
     const issues: string[] = [];
 
-    // Check temporal consistency
     if (scores.temporal_consistency != null) {
       if (scores.temporal_consistency < this.config.temporal_threshold) {
         issues.push(
@@ -212,12 +172,10 @@ export class VideoQC {
       }
     }
 
-    // Check motion detected (reject static/frozen videos)
     if (scores.motion_detected === false) {
       issues.push('No motion detected — video appears static');
     }
 
-    // Check first-frame CLIP
     if (scores.clip_score != null && scores.clip_score >= 0) {
       if (scores.clip_score < this.config.clip_threshold) {
         issues.push(`First-frame CLIP ${scores.clip_score.toFixed(3)} < ${this.config.clip_threshold}`);
@@ -234,72 +192,69 @@ export class VideoQC {
 
   private async computeScores(videoPath: string, prompt: string): Promise<QCScores> {
     const scores: QCScores = {};
-
-    // 1. Temporal Consistency: compare adjacent frames via SSIM
     scores.temporal_consistency = await this.measureTemporalConsistency(videoPath);
-
-    // 2. Motion Detection: optical flow magnitude
     scores.motion_detected = await this.detectMotion(videoPath);
-
-    // 3. First-frame CLIP Score
     scores.clip_score = await this.firstFrameCLIP(videoPath, prompt);
-
     return scores;
   }
 
   /**
-   * Measure frame-to-frame SSIM (structural similarity).
-   * High SSIM between adjacent frames = consistent, low = flickering/artifacts.
+   * Measure frame-to-frame SSIM via ffmpeg (execFile, no shell).
    */
   private async measureTemporalConsistency(videoPath: string): Promise<number> {
     try {
-      // Extract first 10 frames and compute average SSIM between pairs
-      const { stdout } = await execAsync(
-        `ffmpeg -i "${videoPath}" -vf "select=lt(n\\,10),ssim" -f null - 2>&1 | grep "SSIM Mean" | awk '{sum+=$NF; n++} END {print sum/n}'`,
+      const { stderr } = await execFileAsync(
+        'ffmpeg',
+        ['-i', videoPath, '-vf', 'select=lt(n\\,10),ssim', '-f', 'null', '-'],
         { timeout: 30_000 },
       );
 
-      const ssim = parseFloat(stdout.trim());
-      return isNaN(ssim) ? 0.9 : Math.min(1.0, Math.max(0, ssim));
+      // SSIM values appear in stderr for ffmpeg
+      const matches = stderr.match(/All:([0-9.]+)/g);
+      if (matches && matches.length > 0) {
+        const values = matches.map(m => parseFloat(m.split(':')[1]));
+        const avg = values.reduce((a, b) => a + b, 0) / values.length;
+        return Math.min(1.0, Math.max(0, avg));
+      }
+
+      return 0.9; // Default if parsing fails
     } catch {
-      // If SSIM computation fails, assume OK (non-blocking)
       return 0.9;
     }
   }
 
   /**
-   * Detect motion by computing frame differences.
-   * Returns false if the video is essentially a static image.
+   * Detect motion by comparing first and last frames via ffmpeg (execFile).
    */
   private async detectMotion(videoPath: string): Promise<boolean> {
     try {
-      // Compare first and last frame pixel difference
-      const { stdout } = await execAsync(
-        `ffmpeg -i "${videoPath}" -vf "select=eq(n\\,0)+eq(n\\,23),psnr" -f null - 2>&1 | grep "psnr_avg"`,
+      const { stderr } = await execFileAsync(
+        'ffmpeg',
+        ['-i', videoPath, '-vf', 'select=eq(n\\,0)+eq(n\\,23),psnr', '-f', 'null', '-'],
         { timeout: 15_000 },
       );
 
-      // PSNR > 40 typically means frames are nearly identical (no motion)
-      const match = stdout.match(/psnr_avg:([0-9.]+)/);
+      const match = stderr.match(/psnr_avg:([0-9.]+)/);
       if (match) {
         const psnr = parseFloat(match[1]);
-        return psnr < 40; // If PSNR < 40, there IS motion (frames are different)
+        return psnr < 40;
       }
-
-      return true; // Assume motion if we can't measure
+      return true;
     } catch {
       return true;
     }
   }
 
   /**
-   * Extract first frame and compute CLIP score against prompt.
+   * Extract first frame and compute CLIP score (execFile for ffmpeg).
    */
   private async firstFrameCLIP(videoPath: string, prompt: string): Promise<number> {
     try {
       const framePath = `/tmp/qc_frame_${Date.now()}.png`;
-      await execAsync(
-        `ffmpeg -i "${videoPath}" -vf "select=eq(n\\,0)" -vframes 1 "${framePath}"`,
+
+      await execFileAsync(
+        'ffmpeg',
+        ['-i', videoPath, '-vf', 'select=eq(n\\,0)', '-vframes', '1', framePath],
         { timeout: 10_000 },
       );
 
@@ -307,11 +262,11 @@ export class VideoQC {
       const result = await imageQC.evaluate(framePath, prompt);
 
       // Cleanup
-      await execAsync(`rm -f "${framePath}"`).catch(() => {});
+      await execFileAsync('rm', ['-f', framePath]).catch(() => {});
 
       return result.scores.clip_score ?? 0;
     } catch {
-      return 0.3; // Assume passable if extraction fails
+      return 0.3;
     }
   }
 }
@@ -346,7 +301,6 @@ export class QCPipeline {
     const maxRetries = this.config.max_retries;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      // Vary seed on each retry
       const seedOffset = attempt - 1;
       const modifiedReq: GenerateRequest = {
         ...req,
@@ -362,7 +316,6 @@ export class QCPipeline {
         type: req.type,
       });
 
-      // Generate
       const result = await localProvider.generate(modifiedReq);
 
       if (result.status === 'failed') {
@@ -380,7 +333,7 @@ export class QCPipeline {
         ? await this.videoQC.evaluate(result.output.url, req.prompt)
         : req.type === 'text-to-image'
           ? await this.imageQC.evaluate(result.output.url, req.prompt)
-          : { pass: true, scores: {}, issues: [], attempt }; // upscale = skip QC
+          : { pass: true, scores: {}, issues: [], attempt };
 
       qcResult.attempt = attempt;
 
@@ -407,14 +360,13 @@ export class QCPipeline {
       fallback: !!fallbackProvider,
     });
 
-    // Fallback to external API
     if (this.config.fallback_to_api && fallbackProvider) {
       logger.info('Falling back to external API', { provider: fallbackProvider.name });
       const fallbackResult = await fallbackProvider.generate(req);
       return {
         ...fallbackResult,
         qc: {
-          pass: true, // API output assumed to pass
+          pass: true,
           scores: {},
           issues: ['Fallback to external API after QC retries exhausted'],
           attempt: this.config.max_retries + 1,
@@ -422,7 +374,6 @@ export class QCPipeline {
       };
     }
 
-    // No fallback — return last failed result
     return {
       id: `qc_failed_${Date.now()}`,
       status: 'failed',

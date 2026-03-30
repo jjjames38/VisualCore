@@ -19,17 +19,21 @@
  *   [flux-klein, hunyuan]        → 8 + 14 = 22GB ❌ too close to 24GB limit
  */
 
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { type ModelSlot, type GPUStatus } from '@gstack/types';
 import { logger } from '../../config/logger.js';
 import { EventEmitter } from 'node:events';
 
+const execFileAsync = promisify(execFile);
+
 interface ModelInfo {
   vram_gb: number;
-  load_time_ms: number;     // Estimated load time
-  unload_time_ms: number;   // Estimated unload time
-  health_url?: string;      // Health check endpoint
-  load_url?: string;        // Explicit load endpoint
-  unload_url?: string;      // Explicit unload endpoint
+  load_time_ms: number;
+  unload_time_ms: number;
+  health_url?: string;
+  load_url?: string;
+  unload_url?: string;
 }
 
 const MODEL_REGISTRY: Record<ModelSlot, ModelInfo> = {
@@ -69,7 +73,7 @@ const MODEL_REGISTRY: Record<ModelSlot, ModelInfo> = {
 };
 
 const VRAM_TOTAL_GB = 24;
-const VRAM_SAFETY_MARGIN_GB = 2; // Keep 2GB free for system overhead
+const VRAM_SAFETY_MARGIN_GB = 2;
 const VRAM_AVAILABLE_GB = VRAM_TOTAL_GB - VRAM_SAFETY_MARGIN_GB;
 
 interface SwapRequest {
@@ -79,25 +83,17 @@ interface SwapRequest {
 }
 
 export class GPUMemoryManager extends EventEmitter {
-  /** Currently loaded primary model (not counting always-resident models) */
   private primaryModel: ModelSlot | null = null;
-
-  /** Models that are always resident (very small VRAM footprint) */
   private residentModels: Set<ModelSlot> = new Set();
-
-  /** Is a swap currently in progress? */
   private swapping = false;
-
-  /** Queue of pending swap requests */
   private swapQueue: SwapRequest[] = [];
-
-  /** Cumulative VRAM of resident models */
   private residentVram = 0;
+  /** Last queried actual VRAM from nvidia-smi (null if unavailable) */
+  private lastActualVram: number | null = null;
 
   constructor(options?: { fishSpeechResident?: boolean }) {
     super();
 
-    // Fish Speech is always resident by default
     if (options?.fishSpeechResident !== false) {
       const fishInfo = MODEL_REGISTRY['fish-speech'];
       this.residentModels.add('fish-speech');
@@ -108,22 +104,10 @@ export class GPUMemoryManager extends EventEmitter {
     }
   }
 
-  /**
-   * Ensure a model is loaded. If a different model is currently loaded,
-   * unload it first (swap). Queues concurrent requests.
-   */
   async ensureLoaded(model: ModelSlot): Promise<void> {
-    // Already loaded as primary?
-    if (this.primaryModel === model) {
-      return;
-    }
+    if (this.primaryModel === model) return;
+    if (this.residentModels.has(model)) return;
 
-    // Resident model? Always available.
-    if (this.residentModels.has(model)) {
-      return;
-    }
-
-    // If swap is in progress, queue this request
     if (this.swapping) {
       logger.debug('Swap in progress, queuing request', { model, queue_depth: this.swapQueue.length });
       return new Promise<void>((resolve, reject) => {
@@ -134,9 +118,6 @@ export class GPUMemoryManager extends EventEmitter {
     await this.performSwap(model);
   }
 
-  /**
-   * Perform the actual model swap.
-   */
   private async performSwap(target: ModelSlot): Promise<void> {
     this.swapping = true;
     const startTime = Date.now();
@@ -158,24 +139,25 @@ export class GPUMemoryManager extends EventEmitter {
         });
       }
 
-      // Unload current primary model
       if (this.primaryModel) {
         await this.unloadModel(this.primaryModel);
         this.primaryModel = null;
       }
 
-      // Small delay for VRAM to be released
       await this.sleep(1000);
 
-      // Load target model
       await this.loadModel(target);
       this.primaryModel = target;
+
+      // Query actual VRAM after swap for monitoring
+      await this.refreshActualVram();
 
       const elapsed = Date.now() - startTime;
       logger.info('Model swap complete', {
         model: target,
         elapsed_ms: elapsed,
-        vram_used: `${targetInfo.vram_gb + this.residentVram}GB / ${VRAM_TOTAL_GB}GB`,
+        vram_estimated: `${targetInfo.vram_gb + this.residentVram}GB / ${VRAM_TOTAL_GB}GB`,
+        vram_actual: this.lastActualVram != null ? `${this.lastActualVram.toFixed(1)}GB` : 'unknown',
       });
 
       this.emit('swap', { model: target, elapsed_ms: elapsed });
@@ -190,16 +172,10 @@ export class GPUMemoryManager extends EventEmitter {
     }
   }
 
-  /**
-   * Process queued swap requests after current swap completes.
-   */
   private processQueue(): void {
     if (this.swapQueue.length === 0) return;
 
-    // Deduplicate: if multiple requests want the same model, resolve them all
     const next = this.swapQueue.shift()!;
-
-    // Find all requests for the same model and batch-resolve them
     const sameModel = this.swapQueue.filter(r => r.model === next.model);
     this.swapQueue = this.swapQueue.filter(r => r.model !== next.model);
 
@@ -214,9 +190,6 @@ export class GPUMemoryManager extends EventEmitter {
       });
   }
 
-  /**
-   * Load a model into GPU memory.
-   */
   private async loadModel(model: ModelSlot): Promise<void> {
     const info = MODEL_REGISTRY[model];
     logger.debug('Loading model', { model, estimated_ms: info.load_time_ms });
@@ -231,15 +204,11 @@ export class GPUMemoryManager extends EventEmitter {
           logger.warn(`Model load endpoint returned ${res.status}`, { model });
         }
       } catch (error) {
-        // Non-fatal: model may auto-load on first request
         logger.warn('Model load endpoint failed (will load on first use)', { model, error });
       }
     }
   }
 
-  /**
-   * Unload a model from GPU memory.
-   */
   private async unloadModel(model: ModelSlot): Promise<void> {
     const info = MODEL_REGISTRY[model];
     logger.debug('Unloading model', { model });
@@ -255,13 +224,57 @@ export class GPUMemoryManager extends EventEmitter {
       }
     }
 
-    // Force garbage collection delay
     await this.sleep(info.unload_time_ms);
   }
 
+  // ─── Actual VRAM Monitoring ───
+
   /**
-   * Get current GPU status.
+   * Query actual GPU VRAM usage.
+   * Priority: ComfyUI /system_stats → nvidia-smi → null (unavailable)
    */
+  async refreshActualVram(): Promise<number | null> {
+    // Try ComfyUI system_stats first
+    try {
+      const res = await fetch('http://localhost:8188/system_stats', {
+        signal: AbortSignal.timeout(3000),
+      });
+      if (res.ok) {
+        const stats = await res.json() as {
+          system?: { vram_used?: number; vram_total?: number };
+          devices?: Array<{ vram_used: number; vram_total: number }>;
+        };
+        // ComfyUI returns bytes; convert to GB
+        const device = stats.devices?.[0];
+        if (device?.vram_used) {
+          this.lastActualVram = device.vram_used / (1024 ** 3);
+          return this.lastActualVram;
+        }
+      }
+    } catch {
+      // ComfyUI not available, try nvidia-smi
+    }
+
+    // Try nvidia-smi (no shell — execFile with args)
+    try {
+      const { stdout } = await execFileAsync(
+        'nvidia-smi',
+        ['--query-gpu=memory.used', '--format=csv,noheader,nounits'],
+        { timeout: 5000 },
+      );
+      const mbUsed = parseFloat(stdout.trim().split('\n')[0]);
+      if (!isNaN(mbUsed)) {
+        this.lastActualVram = mbUsed / 1024;
+        return this.lastActualVram;
+      }
+    } catch {
+      // nvidia-smi not available (dev environment)
+    }
+
+    this.lastActualVram = null;
+    return null;
+  }
+
   getStatus(): GPUStatus {
     const primaryVram = this.primaryModel
       ? MODEL_REGISTRY[this.primaryModel]?.vram_gb ?? 0
@@ -271,15 +284,13 @@ export class GPUMemoryManager extends EventEmitter {
       current_model: this.primaryModel,
       resident_models: Array.from(this.residentModels),
       vram_used_gb: primaryVram + this.residentVram,
+      vram_actual_gb: this.lastActualVram,
       vram_total_gb: VRAM_TOTAL_GB,
       is_swapping: this.swapping,
       swap_queue_depth: this.swapQueue.length,
     };
   }
 
-  /**
-   * Force unload all models (for shutdown / emergency).
-   */
   async unloadAll(): Promise<void> {
     if (this.primaryModel) {
       await this.unloadModel(this.primaryModel);

@@ -144,4 +144,17 @@ export class ProviderRouter {
 
     return results as Record<ProviderName, boolean>;
   }
+
+  /**
+   * Dispose all providers that have a dispose method.
+   * Call during server shutdown to clean up persistent connections.
+   */
+  dispose(): void {
+    for (const [name, provider] of this.providers) {
+      if ('dispose' in provider && typeof (provider as any).dispose === 'function') {
+        (provider as any).dispose();
+        logger.info('Provider disposed', { provider: name });
+      }
+    }
+  }
 }

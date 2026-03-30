@@ -1,25 +1,23 @@
 /**
- * Logger stub — replace with RenderForge's actual logger (pino / winston).
- * This file exists so the VisualCore modules can be developed standalone.
- * In production, import from '../../config/logger.js' (RenderForge's logger).
+ * VisualCore — Logger
+ *
+ * Structured JSON logger with configurable log level.
+ * In production, replace with pino for better performance.
  */
 
 type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
-interface LogEntry {
-  level: LogLevel;
-  msg: string;
-  data?: Record<string, unknown>;
-  timestamp: string;
-}
+const LEVEL_ORDER: Record<LogLevel, number> = {
+  debug: 0,
+  info: 1,
+  warn: 2,
+  error: 3,
+};
+
+const currentLevel: LogLevel = (process.env.LOG_LEVEL as LogLevel) || 'info';
 
 function log(level: LogLevel, msg: string, data?: Record<string, unknown>): void {
-  const entry: LogEntry = {
-    level,
-    msg,
-    data,
-    timestamp: new Date().toISOString(),
-  };
+  if (LEVEL_ORDER[level] < LEVEL_ORDER[currentLevel]) return;
 
   const prefix = {
     debug: '\x1b[36m[DEBUG]\x1b[0m',
@@ -29,7 +27,7 @@ function log(level: LogLevel, msg: string, data?: Record<string, unknown>): void
   }[level];
 
   const dataStr = data ? ` ${JSON.stringify(data)}` : '';
-  console.log(`${entry.timestamp} ${prefix} ${msg}${dataStr}`);
+  console.log(`${new Date().toISOString()} ${prefix} ${msg}${dataStr}`);
 }
 
 export const logger = {

@@ -3,13 +3,15 @@
  *
  * Upscales 480p video/images to 720p/1080p using Real-ESRGAN.
  * Uses realesrgan-ncnn-vulkan CLI for GPU-accelerated upscaling.
+ *
+ * Security: All external commands use execFile (no shell) to prevent injection.
  */
 
 import { randomUUID } from 'node:crypto';
-import { exec } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { existsSync } from 'node:fs';
-import { stat } from 'node:fs/promises';
+import { mkdir, rm } from 'node:fs/promises';
 import path from 'node:path';
 import {
   type GenerateProvider,
@@ -19,21 +21,22 @@ import {
 } from '@gstack/types';
 import { logger } from '../../config/logger.js';
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 const REALESRGAN_BIN = process.env.REALESRGAN_BIN || 'realesrgan-ncnn-vulkan';
+const ESRGAN_IMAGE_MODEL = process.env.ESRGAN_IMAGE_MODEL || 'realesrgan-x4plus';
+const ESRGAN_VIDEO_MODEL = process.env.ESRGAN_VIDEO_MODEL || 'realesrgan-x4plus-anime';
 
 export class RealEsrganProvider implements GenerateProvider {
   readonly name: ProviderName = 'realesrgan';
 
   async isAvailable(): Promise<boolean> {
     try {
-      await execAsync(`${REALESRGAN_BIN} -h`);
+      await execFileAsync(REALESRGAN_BIN, ['-h']);
       return true;
     } catch {
-      // Try python version
       try {
-        await execAsync('python -c "import realesrgan"');
+        await execFileAsync('python3', ['-c', 'import realesrgan']);
         return true;
       } catch {
         return false;
@@ -73,7 +76,6 @@ export class RealEsrganProvider implements GenerateProvider {
       const ext = path.extname(inputPath);
       const outputPath = inputPath.replace(ext, `_${factor}x${ext}`);
 
-      // Detect if input is video or image
       const isVideo = ['.mp4', '.webm', '.mov', '.avi'].includes(ext.toLowerCase());
 
       if (isVideo) {
@@ -83,8 +85,6 @@ export class RealEsrganProvider implements GenerateProvider {
       }
 
       const gpuTimeMs = Date.now() - startTime;
-
-      // Get output dimensions
       const dims = await this.getMediaDimensions(outputPath);
 
       logger.info('Upscale complete', {
@@ -126,64 +126,83 @@ export class RealEsrganProvider implements GenerateProvider {
   }
 
   private async upscaleImage(input: string, output: string, factor: number): Promise<void> {
-    const model = factor >= 4 ? 'realesrgan-x4plus' : 'realesrgan-x4plus';
-    const cmd = `${REALESRGAN_BIN} -i "${input}" -o "${output}" -s ${factor} -n ${model}`;
+    logger.debug('Running Real-ESRGAN image upscale', { input, factor });
 
-    logger.debug('Running Real-ESRGAN', { cmd });
-    const { stderr } = await execAsync(cmd, { timeout: 600_000 });
+    await execFileAsync(
+      REALESRGAN_BIN,
+      ['-i', input, '-o', output, '-s', String(factor), '-n', ESRGAN_IMAGE_MODEL],
+      { timeout: 600_000 },
+    );
 
     if (!existsSync(output)) {
-      throw new Error(`Upscale output not found: ${output}. stderr: ${stderr}`);
+      throw new Error(`Upscale output not found: ${output}`);
     }
   }
 
   private async upscaleVideo(input: string, output: string, factor: number): Promise<void> {
-    // For video: extract frames → upscale → reassemble
-    // Using ffmpeg + realesrgan pipeline
     const tmpDir = `/tmp/upscale_${randomUUID()}`;
 
     try {
-      // 1. Extract frames
-      await execAsync(`mkdir -p ${tmpDir}/frames ${tmpDir}/upscaled`);
-      await execAsync(`ffmpeg -i "${input}" -qscale:v 2 "${tmpDir}/frames/frame_%06d.png"`, {
-        timeout: 120_000,
-      });
+      await mkdir(`${tmpDir}/frames`, { recursive: true });
+      await mkdir(`${tmpDir}/upscaled`, { recursive: true });
+
+      // 1. Extract frames (execFile — no shell)
+      await execFileAsync(
+        'ffmpeg',
+        ['-i', input, '-qscale:v', '2', `${tmpDir}/frames/frame_%06d.png`],
+        { timeout: 120_000 },
+      );
 
       // 2. Upscale all frames
-      await execAsync(
-        `${REALESRGAN_BIN} -i "${tmpDir}/frames" -o "${tmpDir}/upscaled" -s ${factor} -n realesrgan-x4plus-anime -f png`,
+      await execFileAsync(
+        REALESRGAN_BIN,
+        ['-i', `${tmpDir}/frames`, '-o', `${tmpDir}/upscaled`, '-s', String(factor), '-n', ESRGAN_VIDEO_MODEL, '-f', 'png'],
         { timeout: 600_000 },
       );
 
       // 3. Get original framerate
-      const { stdout: probeOut } = await execAsync(
-        `ffprobe -v quiet -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "${input}"`,
+      const { stdout: probeOut } = await execFileAsync(
+        'ffprobe',
+        ['-v', 'quiet', '-select_streams', 'v:0', '-show_entries', 'stream=r_frame_rate', '-of', 'csv=p=0', input],
       );
       const fps = probeOut.trim() || '24/1';
 
-      // 4. Reassemble
-      // Copy audio from original if present
+      // 4. Check for audio
       const hasAudio = await this.hasAudioStream(input);
-      const audioFlag = hasAudio ? `-i "${input}" -map 0:v -map 1:a -c:a copy` : '';
 
-      await execAsync(
-        `ffmpeg -framerate ${fps} -i "${tmpDir}/upscaled/frame_%06d.png" ${audioFlag} -c:v libx264 -pix_fmt yuv420p -crf 18 -preset fast "${output}"`,
-        { timeout: 300_000 },
+      // 5. Reassemble — build ffmpeg args
+      const ffmpegArgs = [
+        '-framerate', fps,
+        '-i', `${tmpDir}/upscaled/frame_%06d.png`,
+      ];
+
+      if (hasAudio) {
+        ffmpegArgs.push('-i', input, '-map', '0:v', '-map', '1:a', '-c:a', 'copy');
+      }
+
+      ffmpegArgs.push(
+        '-c:v', 'libx264',
+        '-pix_fmt', 'yuv420p',
+        '-crf', '18',
+        '-preset', 'fast',
+        output,
       );
+
+      await execFileAsync('ffmpeg', ffmpegArgs, { timeout: 300_000 });
 
       if (!existsSync(output)) {
         throw new Error(`Video upscale output not found: ${output}`);
       }
     } finally {
-      // Cleanup temp frames
-      await execAsync(`rm -rf "${tmpDir}"`).catch(() => {});
+      await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
     }
   }
 
   private async hasAudioStream(videoPath: string): Promise<boolean> {
     try {
-      const { stdout } = await execAsync(
-        `ffprobe -v quiet -select_streams a -show_entries stream=codec_type -of csv=p=0 "${videoPath}"`,
+      const { stdout } = await execFileAsync(
+        'ffprobe',
+        ['-v', 'quiet', '-select_streams', 'a', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', videoPath],
       );
       return stdout.trim().length > 0;
     } catch {
@@ -193,8 +212,9 @@ export class RealEsrganProvider implements GenerateProvider {
 
   private async getMediaDimensions(filePath: string): Promise<{ width: number; height: number }> {
     try {
-      const { stdout } = await execAsync(
-        `ffprobe -v quiet -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "${filePath}"`,
+      const { stdout } = await execFileAsync(
+        'ffprobe',
+        ['-v', 'quiet', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=p=0', filePath],
       );
       const [w, h] = stdout.trim().split(',').map(Number);
       return { width: w || 0, height: h || 0 };
